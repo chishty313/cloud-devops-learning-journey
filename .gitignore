@@ -1,0 +1,47 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+crash.*.log
+
+# Local secrets
+.env
+.env.local
+*.pem
+*.key
+*.pfx
+credentials.json
+azureauth.json
+
+# OS + editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Python venv (in case we use it)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node (in case we containerize a JS app)
+node_modules/
+dist/
+build/
+
+# Ansible
+*.retry
+.ansible/
+
+# Packer
+packer_cache/
+manifest.json
+
+# kubectl / helm
+kubeconfig
+kubeconfig.*
