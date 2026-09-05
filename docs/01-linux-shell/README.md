@@ -174,8 +174,189 @@ exit
 
 ---
 
-## Concept 2 — Permissions & ownership (coming next)
+## Concept 2 — Permissions & ownership
 
-Every "permission denied" you've ever seen boils down to one of three questions. We'll answer them next.
+### The three questions behind every "Permission denied"
 
-*(this section fills in as we go)*
+Every `Permission denied` you'll ever see comes down to answering three questions, in order:
+
+```mermaid
+flowchart LR
+    Q1["1. Who am I?<br/>(what identity does<br/>my process have?)"] --> Q2["2. Who owns the file,<br/>and what group is it in?"] --> Q3["3. What do the file's<br/>permission bits say<br/>each of those can do?"] --> V{{"Allow<br/>or deny?"}}
+```
+
+The Linux permission system is startlingly small — a couple of dozen bytes per file — but it's the foundation the entire Unix security model is built on, and the exact same mental model shows up in container security, Kubernetes `securityContext`, and cloud IAM analogies. Learning it well pays interest forever.
+
+### The 9-bit permission model
+
+Every file and directory carries three sets of three bits: what the **owner** can do, what the **group** can do, and what **other** (everyone else) can do.
+
+```
+     ┌────── owner ──────┐  ┌────── group ──────┐  ┌────── other ──────┐
+       r        w        x    r        w        x    r        w        x
+       │        │        │
+      read    write   execute       (repeated for group and other)
+```
+
+`ls -l` displays these as a 10-character string:
+
+```
+    -rwxr-xr--   ← 1 file-type char + 9 permission bits
+    │└─┬─┘└─┬─┘└─┬─┘
+    │  owner group other
+    │
+    └── file type: - regular file
+                    d directory
+                    l symlink
+                    c character device (terminals, ttys)
+                    b block device (disks)
+                    s socket
+                    p named pipe (FIFO)
+```
+
+Written as **octal** (the "chmod 755" you've seen everywhere), each triad is 3 bits = 0–7:
+
+| Value | Bits  | Meaning       |
+| ----- | ----- | ------------- |
+| 7     | `rwx` | read + write + execute |
+| 6     | `rw-` | read + write |
+| 5     | `r-x` | read + execute |
+| 4     | `r--` | read only |
+| 3     | `-wx` | write + execute (rare) |
+| 2     | `-w-` | write only (rarer) |
+| 1     | `--x` | execute only |
+| 0     | `---` | nothing |
+
+So `chmod 755 foo` means: owner `rwx`, group `r-x`, other `r-x`. That's the default for an executable file you want everyone to be able to run.
+
+### The gotcha: what `x` means on a **directory**
+
+- On a **file**, `x` means "this can be executed as a program."
+- On a **directory**, `x` means "you may `cd` into it and access files inside it by name."
+
+**Without `x` on a directory, you cannot reach any file within it — even if the file's own bits would allow you.** That's why directories default to `755` even when the files inside are just data — the `x` on the dir is what makes the files reachable.
+
+Think of a directory's `x` as "the key to the door"; `r` on a directory only lets you *list* what's inside (see the names).
+
+### `chmod` in symbolic form — often clearer than octal
+
+Instead of memorising octal, you can add or remove specific bits:
+
+```bash
+chmod u+x script.sh     # give the owner (u) execute
+chmod g-w file          # remove write from group (g)
+chmod o=r file          # set 'other' (o) to read-only exactly
+chmod a+r file          # everyone (a=all) gets read
+chmod u=rwx,g=rx,o=     # set all three at once
+```
+
+Both forms produce the same file mode — use whichever reads clearer for the change you're making.
+
+### Owner, group, and root
+
+- **Owner** and **group** are named identities that live in `/etc/passwd` and `/etc/group`.
+- **Root** (user id 0) **bypasses the 9-bit check entirely**. Root can read and write anything on the filesystem, ignoring permission bits.
+
+> [!WARNING]
+> That last point is why **containers running as root are dangerous.** If a container process gets compromised, the attacker starts with the ability to touch anything the container can see — including mounted volumes from the host. Best practice: run containers as a non-root user (via the `USER` directive in a Dockerfile). The same idea shows up in Kubernetes as `securityContext.runAsNonRoot: true` and `runAsUser: <nonzero-uid>`.
+
+### `umask` — the default permissions for new files
+
+When you `touch` a new file, it doesn't get `777`. It gets a default determined by the **umask**, which is a mask of bits to *strip* from `666` (files) or `777` (directories):
+
+```
+umask 022  →  new files get 644, new dirs get 755   ← common default
+umask 077  →  new files get 600, new dirs get 700   ← private-by-default
+umask 002  →  new files get 664, new dirs get 775   ← "team writable" setups
+```
+
+Show your current umask: `umask`. Change it for the current shell: `umask 077`. Make it permanent in `~/.bashrc` or `/etc/profile`. This matters for security-conscious systems where new files must default to private.
+
+### Ownership: `chown` and `chgrp`
+
+Only root can change file ownership:
+
+```bash
+chown alice file                  # transfer file to user alice
+chown alice:developers file       # user alice, group developers
+chgrp developers file             # only change group
+chown -R alice:alice /home/alice  # recursive — the "R" is essential
+```
+
+> [!TIP]
+> `chown -R` is one of the most common recovery commands after a **container volume mount** — when a volume mounts as root and the app can't write to it, you `chown -R app:app /path` to fix it. Every DevOps engineer has typed this at 2am at least once.
+
+### The special bits: setuid, setgid, sticky (brief)
+
+You'll see these in the wild; just recognise them for now.
+
+- **setuid** — `s` where `x` for owner would be. The program runs as its *owner* instead of the caller. This is how `sudo` and `passwd` can perform privileged operations for unprivileged users. Look for `-rwsr-xr-x` on `/usr/bin/passwd`.
+- **setgid** — `s` where `x` for group would be. On a *directory*, files created inside inherit the directory's group. Useful for shared team folders.
+- **sticky bit** — `t` where `x` for other would be. In a shared writable dir like `/tmp`, only the *file's owner* can delete a file, even if others have write on the directory. This is why `/tmp` is safe for everyone to share.
+
+### Hands-on 2: prove the model in a container
+
+Spin up a fresh Ubuntu container and run through the sequence:
+
+```bash
+docker run --rm -it ubuntu:24.04 bash
+```
+
+Inside the container, run these in order:
+
+```bash
+# --- 1. Who am I? What's my umask? ---
+whoami
+id
+umask
+
+# --- 2. Create a file, inspect its default perms ---
+touch /tmp/hello.txt
+ls -l /tmp/hello.txt
+
+# --- 3. Change perms with both forms of chmod ---
+chmod 600 /tmp/hello.txt
+ls -l /tmp/hello.txt        # expect: -rw-------
+chmod g+r,o+r /tmp/hello.txt
+ls -l /tmp/hello.txt        # expect: -rw-r--r--
+
+# --- 4. Create a non-root user, then become her ---
+useradd -m alice
+id alice
+ls -ld /home/alice
+su - alice
+
+# --- 5. As alice, see the world with narrower privilege ---
+whoami
+id
+ls -la /root 2>&1 | head -5     # root's home is 700 — should be denied
+touch /etc/alice-was-here 2>&1  # /etc is root-owned — should fail
+touch ~/notes.txt && ls -l ~/notes.txt   # her own home is fine
+exit                              # back to root
+
+# --- 6. Give a file to alice with chown ---
+touch /tmp/gift.txt
+ls -l /tmp/gift.txt
+chown alice:alice /tmp/gift.txt
+ls -l /tmp/gift.txt
+
+exit   # exit container
+```
+
+**Paste back these five lines/blocks:**
+
+1. Output of `id` (as root inside the container).
+2. `ls -l /tmp/hello.txt` **after the first `chmod 600`** — confirms `-rw-------`.
+3. The error(s) alice got trying to read `/root` and write to `/etc`.
+4. The `ls -l ~/notes.txt` line as alice — confirms she can write in her own home.
+5. The `ls -l /tmp/gift.txt` line **after `chown alice:alice`** — confirms ownership transferred.
+
+Once we have your outputs, the hands-on log gets updated and we move to **Concept 3 — processes & services** (`ps`, `top`, `systemctl`, `journalctl` — the toolkit you use to answer *"what's actually running on this box?"*).
+
+### Concept 2 — takeaway
+
+- 🔑 Every "Permission denied" is answered by the same three-question sequence: *who am I → who owns the file → what do the bits say?*
+- 🔢 The 9 permission bits are the whole game: 3 sets of `rwx` for owner, group, other. Octal is just those bits written compactly.
+- 📂 On a **directory**, `x` means "the key to the door" — without it, files inside are unreachable even if their own bits say yes.
+- 🧨 **Root ignores the 9-bit check.** That's why running containers or K8s pods as root is a security anti-pattern.
+- 🎭 `umask` decides the *default* perms new files get. Security-sensitive systems set it to `077` (private-by-default).
